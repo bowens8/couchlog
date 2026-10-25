@@ -472,7 +472,7 @@ async function pageUser(uid, tab = "diary", filter = "all") {
   view.innerHTML = `<div class="row" style="margin-bottom:14px">
       ${u.photo ? `<img class="avatar" style="width:56px;height:56px" src="${esc(u.photo)}" referrerpolicy="no-referrer" alt="">` : ""}
       <h1 style="margin:0;flex:1">${esc(u.name)}</h1>
-      ${uid === me.uid ? `<a href="#/import"><button class="ghost">Import from Letterboxd</button></a>` : ""}</div>
+      ${uid === me.uid ? `<a class="btnlink" href="#/import">Import from Letterboxd</a>` : ""}</div>
     <div class="row">
       <div class="stat"><b>${watched.filter(e => e.type === "movie").length}</b><span>Films</span></div>
       <div class="stat"><b>${watched.filter(e => e.type === "tv").length}</b><span>Shows</span></div>
@@ -529,20 +529,28 @@ function loadScript(src) {
   });
 }
 const LB_FILES = ["watched.csv", "ratings.csv", "diary.csv", "reviews.csv", "watchlist.csv"];
+const LB_SKIP_DIRS = ["deleted", "likes", "lists", "comments", "orphaned"];
+function lbName(path) {
+  const parts = path.toLowerCase().split("/"); const base = parts.pop();
+  if (parts.some(p => LB_SKIP_DIRS.includes(p))) return null;
+  return LB_FILES.includes(base) ? base : null;
+}
 async function readLetterboxdFiles(fileList) {
   const out = {};
   for (const file of fileList) {
-    const name = file.name.toLowerCase();
-    if (name.endsWith(".zip")) {
+    const rel = file.webkitRelativePath || file.name;
+    if (rel.toLowerCase().endsWith(".zip")) {
       if (!window.JSZip) await loadScript("https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js");
       const zip = await window.JSZip.loadAsync(file);
       for (const [path, entry] of Object.entries(zip.files)) {
         if (entry.dir) continue;
-        const parts = path.toLowerCase().split("/"); const base = parts.pop();
-        if (parts.some(p => ["deleted", "likes", "lists", "comments", "orphaned"].includes(p))) continue;
-        if (LB_FILES.includes(base)) out[base] = await entry.async("string");
+        const n = lbName(path);
+        if (n) out[n] = await entry.async("string");
       }
-    } else if (LB_FILES.includes(name)) out[name] = await file.text();
+    } else {
+      const n = lbName(rel);
+      if (n) out[n] = await file.text();
+    }
   }
   return out;
 }
@@ -561,8 +569,15 @@ async function commitChunk(chunk) {
     const batch = writeBatch(db);
     chunk.forEach(d => batch.set(doc(db, "entries", entryId(me.uid, d.key)), d));
     await batch.commit();
-  } catch (e) { // fall back to one-by-one if a batch is rejected
-    for (const d of chunk) await setDoc(doc(db, "entries", entryId(me.uid, d.key)), d);
+  } catch (e) { // if a batch is rejected, write the docs individually
+    let i = 0, firstErr = null;
+    await Promise.all(Array.from({ length: 8 }, async () => {
+      while (i < chunk.length) {
+        const d = chunk[i++];
+        try { await setDoc(doc(db, "entries", entryId(me.uid, d.key)), d); } catch (err) { firstErr ||= err; }
+      }
+    }));
+    if (firstErr) throw firstErr;
   }
 }
 
@@ -570,24 +585,39 @@ function pageImport() {
   view.innerHTML = `<h1>Import from Letterboxd</h1>
     <ol class="muted" style="line-height:1.7">
       <li>On letterboxd.com go to <b>Settings → Data → Export your data</b> and download the zip.</li>
-      <li>Choose the zip below. (Or pick the CSVs inside it: watched, ratings, diary, reviews, watchlist.)</li>
+      <li>Pick the zip below. If your computer already unzipped it into a folder, pick that folder instead.</li>
     </ol>
+    <label>Zip file (or the CSVs from inside it)</label>
     <input type="file" id="files" accept=".zip,.csv" multiple>
+    <label>Or the unzipped folder</label>
+    <input type="file" id="folder" webkitdirectory>
+    <p class="muted" id="picked" style="margin:8px 0 0"></p>
     <label class="chk" style="margin-top:14px"><input type="checkbox" id="skip" checked> Skip films I've already logged here</label>
     <label class="chk" style="margin-top:6px"><input type="checkbox" id="usedates" checked> Keep watched dates from my diary (uncheck to import without any dates)</label>
     <button id="go" style="margin-top:16px" disabled>Import</button>
     <div id="prog" style="margin-top:18px"></div>
     <p class="muted" style="margin-top:24px;font-size:13px">Letterboxd only exports films, so no TV comes over. Films are matched to TMDB by title and year; anything that can't be matched is listed so you can add it by hand.</p>`;
-  const files = $("#files"), go = $("#go"), prog = $("#prog");
-  files.onchange = () => (go.disabled = !files.files.length);
+  const files = $("#files"), folder = $("#folder"), go = $("#go"), prog = $("#prog");
+  let chosen = [];
+  const pick = el => {
+    chosen = [...el.files];
+    $("#picked").textContent = chosen.length ? `${chosen.length} file${chosen.length === 1 ? "" : "s"} selected` : "";
+    go.disabled = !chosen.length;
+  };
+  files.onchange = () => pick(files);
+  folder.onchange = () => pick(folder);
   go.onclick = async () => {
-    go.disabled = true; files.disabled = true;
+    const lock = on => { go.disabled = on; files.disabled = on; folder.disabled = on; };
+    const fail = msg => { prog.innerHTML = `<p style="color:var(--danger)">${esc(msg)}</p>`; lock(false); };
+    lock(true);
     const skip = $("#skip").checked, useDates = $("#usedates").checked;
     try {
       prog.innerHTML = `<p class="muted">Reading files…</p>`;
-      const texts = await readLetterboxdFiles(files.files);
-      if (!Object.keys(texts).length) throw new Error("Couldn't find watched.csv, ratings.csv, diary.csv, reviews.csv or watchlist.csv in what you picked.");
+      const texts = await readLetterboxdFiles(chosen);
+      const found = LB_FILES.filter(n => texts[n]);
+      if (!found.length) return fail(`Couldn't find watched.csv, ratings.csv, diary.csv, reviews.csv or watchlist.csv in the ${chosen.length} file(s) you picked.`);
       const P = n => (texts[n] ? parseCSV(texts[n]) : []);
+      const counts = found.map(n => `${n.replace(".csv", "")} ${P(n).length}`).join(", ");
       const films = new Map();
       const get = r => {
         const name = (r["Name"] || "").trim(), year = (r["Year"] || "").trim(); if (!name) return null;
@@ -601,20 +631,23 @@ function pageImport() {
       for (const r of P("reviews.csv"))  { const f = get(r); if (f) { f.status = "watched"; if (r["Rating"]) f.rating = +r["Rating"]; if (r["Review"]) f.review = r["Review"].trim(); const w = r["Watched Date"]; if (w && w > f.watchedOn) f.watchedOn = w; f.logged ||= r["Date"]; } }
       for (const r of P("watchlist.csv")) { const f = get(r); if (f && !f.status) { f.status = "watchlist"; f.logged ||= r["Date"]; } }
       const list = [...films.values()].filter(f => f.status);
+      if (!list.length) return fail(`Read ${counts} rows, but found no films. Columns seen: ${Object.keys(P(found[0])[0] || {}).join(", ") || "none"}.`);
 
       // match to TMDB (a few at a time)
       const matched = [], unmatched = [];
-      let n = 0;
-      const bar = () => (prog.innerHTML = `<p class="muted">Matching films… ${n} / ${list.length}</p><progress max="${list.length}" value="${n}"></progress>`);
+      let n = 0, errs = 0, firstErr = "";
+      const bar = () => (prog.innerHTML = `<p class="muted">Read ${esc(counts)}. Matching films… ${n} / ${list.length}</p><progress max="${list.length}" value="${n}"></progress>`);
       bar();
       let idx = 0;
-      await Promise.all(Array.from({ length: 6 }, async () => {
+      await Promise.all(Array.from({ length: 4 }, async () => {
         while (idx < list.length) {
           const f = list[idx++];
-          try { const r = await matchFilm(f); r ? matched.push({ f, r }) : unmatched.push(f); } catch { unmatched.push(f); }
+          try { const r = await matchFilm(f); r ? matched.push({ f, r }) : unmatched.push(f); }
+          catch (e) { errs++; firstErr ||= e.message; unmatched.push(f); }
           n++; if (n % 5 === 0 || n === list.length) bar();
         }
       }));
+      if (!matched.length) return fail(errs ? `Couldn't reach TMDB (${firstErr}). Check the TMDB key in config.js and try again.` : "None of the films could be matched to TMDB.");
 
       // build entries
       const seenKeys = new Set(), docs = []; let skipped = 0;
@@ -631,20 +664,20 @@ function pageImport() {
           updatedAt: Timestamp.fromDate(when)   // dated to when you watched/logged it, so imports don't flood the feed
         });
       }
-      let saved = 0;
-      for (let i = 0; i < docs.length; i += 300) {
-        await commitChunk(docs.slice(i, i + 300));
-        saved = Math.min(i + 300, docs.length);
+      const CH = 20;
+      for (let i = 0; i < docs.length; i += CH) {
+        await commitChunk(docs.slice(i, i + CH));
+        const saved = Math.min(i + CH, docs.length);
         prog.innerHTML = `<p class="muted">Saving… ${saved} / ${docs.length}</p><progress max="${docs.length}" value="${saved}"></progress>`;
       }
       docs.forEach(d => (myEntries[d.key] = d));
       prog.innerHTML = `<h2 style="margin-top:0">Done</h2>
-        <p>Imported <b>${docs.length}</b> titles${skipped ? `, skipped ${skipped} you'd already logged` : ""}${unmatched.length ? `, couldn't match ${unmatched.length}` : ""}.</p>
+        <p>Read ${esc(counts)}. Imported <b>${docs.length}</b> titles${skipped ? `, skipped ${skipped} you'd already logged` : ""}${unmatched.length ? `, couldn't match ${unmatched.length}` : ""}.</p>
+        ${errs ? `<p style="color:var(--danger)">${errs} lookups failed (${esc(firstErr)}). Run the import again to retry those; films you've already imported will be skipped.</p>` : ""}
         ${unmatched.length ? `<details><summary class="muted">Couldn't match these</summary><ul class="muted">${unmatched.map(f => `<li>${esc(f.name)}${f.year ? ` (${esc(f.year)})` : ""}</li>`).join("")}</ul></details>` : ""}
-        <a href="#/me"><button style="margin-top:12px">Go to my diary</button></a>`;
+        <a class="btnlink solid" href="#/me" style="margin-top:12px">Go to my diary</a>`;
     } catch (e) {
-      prog.innerHTML = `<p style="color:var(--danger)">${esc(e.message)}</p>`;
-      go.disabled = false; files.disabled = false;
+      fail(`${e.code ? e.code + ": " : ""}${e.message}`);
     }
   };
 }
