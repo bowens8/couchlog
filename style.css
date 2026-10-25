@@ -105,3 +105,11 @@ progress{width:100%;height:10px;accent-color:var(--accent)}
 input[type=file]{padding:12px}
 details{margin:10px 0}
 textarea{min-height:120px}
+
+/* --- iPhone home-screen app --- */
+#topbar{padding-top:calc(12px + env(safe-area-inset-top));padding-left:calc(18px + env(safe-area-inset-left));padding-right:calc(18px + env(safe-area-inset-right))}
+main{padding-bottom:calc(80px + env(safe-area-inset-bottom))}
+.btnlink{display:inline-block;border:1px solid var(--panel2);color:var(--muted);border-radius:6px;padding:9px 14px;font-weight:600}
+.btnlink:hover{color:var(--text)}
+.btnlink.solid{background:var(--accent);color:#04210f;border-color:var(--accent)}
+html{-webkit-tap-highlight-color:transparent}
