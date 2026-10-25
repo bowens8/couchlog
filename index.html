@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Couchlog</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎬</text></svg>">
+</head>
+<body>
+<header id="topbar" hidden>
+  <a class="brand" href="#/feed">🎬 Couchlog</a>
+  <nav>
+    <a href="#/feed">Feed</a>
+    <a href="#/search">Search</a>
+    <a href="#/me">Me</a>
+    <a href="#/people">Friends</a>
+  </nav>
+  <button id="signout" class="ghost">Sign out</button>
+</header>
+
+<main id="view"></main>
+
+<div id="modal" class="modal" hidden>
+  <div class="modal-card" id="modal-card"></div>
+</div>
+<div id="toast" class="toast" hidden></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isMember() {
+      return request.auth != null
+        && request.auth.token.email != null
+        && exists(/databases/$(database)/documents/allowed/$(request.auth.token.email.lower()));
+    }
+
+    // Friend allowlist: doc ID = lowercase email. Only editable in the Firebase console.
+    match /allowed/{email} {
+      allow get: if request.auth != null
+        && request.auth.token.email != null
+        && request.auth.token.email.lower() == email;
+      allow list, write: if false;
+    }
+
+    match /users/{uid} {
+      allow read: if isMember();
+      allow write: if isMember() && request.auth.uid == uid;
+    }
+
+    match /entries/{id} {
+      allow read: if isMember();
+      allow create: if isMember() && request.resource.data.uid == request.auth.uid;
+      allow update: if isMember() && resource.data.uid == request.auth.uid
+        && request.resource.data.uid == request.auth.uid;
+      allow delete: if isMember() && resource.data.uid == request.auth.uid;
+    }
+  }
+}
