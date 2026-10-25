@@ -2,7 +2,7 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/fireba
 import { getAuth, GoogleAuthProvider, signInWithPopup, onAuthStateChanged, signOut }
   from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
 import { getFirestore, collection, doc, getDoc, getDocs, setDoc, deleteDoc, query, where,
-  orderBy, limit, serverTimestamp, writeBatch, Timestamp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
+  orderBy, limit, serverTimestamp, writeBatch, Timestamp, updateDoc, deleteField } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
 import { firebaseConfig, TMDB_KEY } from "./config.js";
 
 const app = initializeApp(firebaseConfig);
@@ -66,7 +66,8 @@ async function tmdb(path, params = {}, tries = 3) {
 const entryId = (uid, key) => `${uid}_${key}`;
 const metaOf = (r, type) => ({
   type, tmdbId: r.id, key: `${type}_${r.id}`, title: r.title || r.name || "",
-  year: (r.release_date || r.first_air_date || "").slice(0, 4), poster: r.poster_path || ""
+  year: (r.release_date || r.first_air_date || "").slice(0, 4), poster: r.poster_path || "",
+  genres: r.genre_ids || (r.genres ? r.genres.map(g => g.id) : [])
 });
 
 /* ---------- poster cards with quick-add buttons ---------- */
@@ -99,7 +100,7 @@ async function quickLog(m, act) {
     }
     if (ex && ex.status === "watched" && act === "watchlist") { openLog(m, syncQuickBars); return; }
     const data = {
-      ...m, uid: me.uid, status: act,
+      ...m, genres: m.genres || ex?.genres || [], uid: me.uid, status: act,
       rating: null, review: "", watchedOn: "", season: "",
       updatedAt: serverTimestamp()
     };
@@ -140,6 +141,7 @@ onAuthStateChanged(auth, async user => {
     me = user;
     await loadUsers();
     await loadMine();
+    syncShared().catch(() => {});
     topbar.hidden = false;
     route();
   } catch (e) {
@@ -170,6 +172,9 @@ function route() {
   if (page === "feed") return pageFeed();
   if (page === "browse") return pageBrowse(a);
   if (page === "reviews") return pageReviews();
+  if (page !== "list") editing = false;
+  if (page === "lists") return pageLists(a);
+  if (page === "list") return pageList(a);
   if (page === "search") return pageSearch(decodeURIComponent(a || ""));
   if (page === "title") return pageTitle(a, b);
   if (page === "me") return pageUser(me.uid);
@@ -180,16 +185,104 @@ function route() {
 }
 
 /* ---------- feed ---------- */
-async function pageFeed(filter = "all") {
-  view.innerHTML = `<h1>Friends' activity</h1>
-    <div class="tabs">${["all", "movie", "tv"].map(f => `<span class="tab ${f === filter ? "on" : ""}" data-f="${f}">${{ all: "All", movie: "Movies", tv: "TV" }[f]}</span>`).join("")}</div>
-    <div id="list"><p class="muted">Loading…</p></div>`;
-  view.querySelectorAll(".tab").forEach(t => (t.onclick = () => pageFeed(t.dataset.f)));
-  const snap = await getDocs(query(collection(db, "entries"), orderBy("updatedAt", "desc"), limit(120)));
-  let items = snap.docs.map(d => d.data()).filter(e => filter === "all" || e.type === filter);
-  $("#list").innerHTML = items.length ? items.map(feedItem).join("") :
-    `<p class="muted">Nothing here yet. <a href="#/browse" style="color:var(--accent2)">Browse something to log.</a></p>`;
+/* ---------- shared: modal + title picker ---------- */
+function modalOpen(html) {
+  $("#modal-card").innerHTML = html;
+  $("#modal").hidden = false;
+  $("#modal").onclick = e => { if (e.target.id === "modal") modalClose(); };
 }
+function modalClose() { $("#modal").hidden = true; }
+
+function titlePicker(root, onPick) {
+  root.innerHTML = `<input class="tp-q" placeholder="Search for a movie or show…"><div class="tp-res"></div>`;
+  const q = $(".tp-q", root), res = $(".tp-res", root);
+  let t;
+  q.oninput = () => {
+    clearTimeout(t);
+    t = setTimeout(async () => {
+      const term = q.value.trim();
+      if (!term) { res.innerHTML = ""; return; }
+      try {
+        const d = await tmdb("/search/multi", { query: term, include_adult: "false" });
+        const rs = d.results.filter(r => r.media_type === "movie" || r.media_type === "tv").slice(0, 8).map(r => metaOf(r, r.media_type));
+        rs.forEach(m => metaCache.set(m.key, m));
+        res.innerHTML = rs.map(m => `<div class="pick" data-key="${m.key}">${posterImg(m.poster, m.title)}
+          <div><b>${esc(m.title)}</b> <span class="muted">${esc(m.year)} · ${m.type === "tv" ? "TV" : "Film"}</span></div></div>`).join("") || `<p class="muted">No results.</p>`;
+      } catch (e) { res.innerHTML = `<p style="color:var(--danger)">${esc(e.message)}</p>`; }
+    }, 300);
+  };
+  res.onclick = ev => {
+    const p = ev.target.closest(".pick"); if (!p) return;
+    const m = metaCache.get(p.dataset.key); if (m) onPick(m);
+  };
+}
+
+/* ---------- feed (activity + posts) ---------- */
+function postItem(p, id) {
+  const t = p.title;
+  return `<div class="feed-item post">
+    <div style="flex:1">
+      <div class="who">${avatar(p.uid)} <a href="#/user/${p.uid}"><b>${esc(userName(p.uid))}</b></a> posted · ${timeAgo(p.createdAt)}
+        ${p.uid === me.uid ? `<button class="ghost small" data-delpost="${id}" style="float:right">Delete</button>` : ""}</div>
+      ${p.text ? `<div class="review" style="font-size:16px">${esc(p.text)}</div>` : ""}
+      ${t ? `<a class="attach" href="#/title/${t.type}/${t.tmdbId}">${posterImg(t.poster, t.title)}
+        <span><b>${esc(t.title)}</b><br><span class="muted">${esc(t.year)} · ${t.type === "tv" ? "TV" : "Film"}</span></span></a>` : ""}
+    </div></div>`;
+}
+
+async function pageFeed(filter = "all") {
+  let attached = null;
+  view.innerHTML = `<h1>Friends' activity</h1>
+    <div class="composer">
+      <textarea id="ptext" maxlength="1000" placeholder="Share a thought, a recommendation, a hot take…"></textarea>
+      <div id="pchosen" class="muted" style="margin-top:6px"></div>
+      <div class="row" style="margin-top:8px;justify-content:space-between">
+        <button class="ghost small" id="pattach">＋ Attach a title</button>
+        <button id="ppost">Post</button>
+      </div>
+      <div id="ppicker" class="picker" hidden></div>
+    </div>
+    <div class="tabs">${[["all", "All"], ["movie", "Movies"], ["tv", "TV"], ["posts", "Posts"]].map(([f, l]) => `<span class="tab ${f === filter ? "on" : ""}" data-f="${f}">${l}</span>`).join("")}</div>
+    <div id="list"><p class="muted">Loading…</p></div>`;
+  view.querySelectorAll(".tabs .tab").forEach(t => (t.onclick = () => pageFeed(t.dataset.f)));
+
+  const picker = $("#ppicker");
+  titlePicker(picker, m => {
+    attached = m; picker.hidden = true;
+    $("#pchosen").innerHTML = `Attached: <b>${esc(m.title)}</b> ${esc(m.year)} · <a href="#" id="pdetach" style="color:var(--accent2)">remove</a>`;
+    $("#pdetach").onclick = ev => { ev.preventDefault(); attached = null; $("#pchosen").textContent = ""; };
+  });
+  $("#pattach").onclick = () => { picker.hidden = !picker.hidden; if (!picker.hidden) $(".tp-q", picker).focus(); };
+  $("#ppost").onclick = async () => {
+    const text = $("#ptext").value.trim();
+    if (!text && !attached) { toast("Write something first"); return; }
+    try {
+      await setDoc(doc(collection(db, "posts")), {
+        uid: me.uid, text,
+        title: attached ? { key: attached.key, type: attached.type, tmdbId: attached.tmdbId, title: attached.title, year: attached.year || "", poster: attached.poster || "" } : null,
+        createdAt: serverTimestamp()
+      });
+      toast("Posted"); pageFeed(filter);
+    } catch (e) { toast("Couldn't post: " + e.message + " (did you publish the new Firestore rules?)"); }
+  };
+
+  const [es, ps] = await Promise.all([
+    getDocs(query(collection(db, "entries"), orderBy("updatedAt", "desc"), limit(120))),
+    getDocs(query(collection(db, "posts"), orderBy("createdAt", "desc"), limit(60))).catch(() => ({ docs: [] }))
+  ]);
+  const items = [];
+  if (filter !== "posts") es.docs.forEach(d => { const e = d.data(); if (filter === "all" || e.type === filter) items.push({ t: e.updatedAt?.seconds || 0, html: feedItem(e) }); });
+  if (filter === "all" || filter === "posts") ps.docs.forEach(d => { const p = d.data(); items.push({ t: p.createdAt?.seconds || Math.floor(Date.now() / 1000), html: postItem(p, d.id) }); });
+  items.sort((a, b) => b.t - a.t);
+  $("#list").innerHTML = items.length ? items.map(i => i.html).join("") :
+    `<p class="muted">Nothing here yet. <a href="#/browse" style="color:var(--accent2)">Browse something to log.</a></p>`;
+  $("#list").onclick = async ev => {
+    const b = ev.target.closest("[data-delpost]"); if (!b) return;
+    if (!confirm("Delete this post?")) return;
+    await deleteDoc(doc(db, "posts", b.dataset.delpost)); pageFeed(filter);
+  };
+}
+
 function feedItem(e) {
   const verb = e.status === "watchlist" ? "added to watchlist" : "watched";
   const when = e.status === "watched" && e.watchedOn ? ` on ${fmtDate(e.watchedOn)}` : "";
@@ -242,7 +335,7 @@ function pageBrowse(src) {
           const snap = await getDocs(query(collection(db, "entries"), orderBy("updatedAt", "desc"), limit(400)));
           const byKey = new Map();
           snap.docs.forEach(d => { const e = d.data(); if (e.uid !== me.uid && !byKey.has(e.key)) byKey.set(e.key, e); });
-          friends = [...byKey.values()].map(e => ({ type: e.type, tmdbId: e.tmdbId, key: e.key, title: e.title, year: e.year, poster: e.poster }));
+          friends = [...byKey.values()].map(e => ({ type: e.type, tmdbId: e.tmdbId, key: e.key, title: e.title, year: e.year, poster: e.poster, genres: e.genres || [] }));
         }
         items = friends.slice((page - 1) * 40, page * 40);
         if (page * 40 >= friends.length) done = true;
@@ -343,7 +436,7 @@ async function pageTitle(type, id) {
   try { d = await tmdb(`/${type}/${id}`); } catch (e) { view.innerHTML = `<p style="color:var(--danger)">${esc(e.message)}</p>`; return; }
   const title = d.title || d.name, year = (d.release_date || d.first_air_date || "").slice(0, 4);
   const key = `${type}_${id}`;
-  const meta = { type, tmdbId: +id, key, title, year, poster: d.poster_path || "" };
+  const meta = { type, tmdbId: +id, key, title, year, poster: d.poster_path || "", genres: (d.genres || []).map(g => g.id) };
   const sub = type === "tv"
     ? `${d.number_of_seasons || "?"} season${d.number_of_seasons === 1 ? "" : "s"} · ${d.status || ""}`
     : `${d.runtime ? d.runtime + " min" : ""}`;
@@ -359,6 +452,7 @@ async function pageTitle(type, id) {
     <div class="info">
       <h1 style="margin-bottom:2px">${esc(title)}</h1>
       <div class="muted">${esc(year)} · ${type === "tv" ? "TV series" : "Film"} · ${esc(sub)}</div>
+      ${(d.genres || []).length ? `<div class="muted" style="margin-top:2px">${esc(d.genres.map(g => g.name).join(" · "))}</div>` : ""}
       ${d.tagline ? `<p class="muted"><i>${esc(d.tagline)}</i></p>` : ""}
       <p>${esc(d.overview || "")}</p>
       <div class="row" style="margin:14px 0">
@@ -367,10 +461,12 @@ async function pageTitle(type, id) {
         <div class="stat"><b>${all.filter(e => e.status === "watchlist").length}</b><span>Want to</span></div>
       </div>
       <button id="log">${mine ? (mine.status === "watchlist" ? "On your watchlist — log it" : "Edit your entry") : "Log or add to watchlist"}</button>
+      <button class="ghost" id="addlist">＋ Add to list</button>
     </div></div>
     <h2>Friends</h2>
     ${all.length ? all.map(feedItem).join("") : `<p class="muted">Nobody's logged this yet.</p>`}`;
   $("#log").onclick = () => openLog(meta, () => pageTitle(type, id));
+  $("#addlist").onclick = () => openAddToList(meta);
 }
 
 /* ---------- log modal ---------- */
@@ -438,7 +534,7 @@ function openLog(meta, done, opts = {}) {
   $("#save").onclick = async () => {
     const watched = st.status === "watched";
     const data = {
-      ...meta, uid: me.uid, status: st.status,
+      ...meta, genres: meta.genres || ex.genres || [], uid: me.uid, status: st.status,
       rating: watched ? st.rating : null,
       review: watched ? $("#review").value.trim() : "",
       watchedOn: watched ? ($("#nodate").checked ? "" : $("#date").value || today) : "",
@@ -455,19 +551,108 @@ function openLog(meta, done, opts = {}) {
   if (opts.focusReview && st.status === "watched") $("#review").focus();
 }
 
-/* ---------- profile ---------- */
-async function pageUser(uid, tab = "diary", filter = "all") {
+/* ---------- genres ---------- */
+const GENRES = {
+  28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy", 80: "Crime", 99: "Documentary", 18: "Drama",
+  10751: "Family", 14: "Fantasy", 36: "History", 27: "Horror", 10402: "Music", 9648: "Mystery", 10749: "Romance",
+  878: "Sci-Fi", 10770: "TV Movie", 53: "Thriller", 10752: "War", 37: "Western",
+  10759: "Action & Adventure", 10762: "Kids", 10763: "News", 10764: "Reality", 10765: "Sci-Fi & Fantasy",
+  10766: "Soap", 10767: "Talk", 10768: "War & Politics"
+};
+const genreNames = e => { const n = (e.genres || []).map(i => GENRES[i]).filter(Boolean); return n.length ? n : ["Other"]; };
+const genreOf = e => genreNames(e)[0];
+
+let backfilling = false;
+async function backfillGenres(entries) {
+  if (backfilling) return false;
+  backfilling = true;
+  let changed = false;
+  try {
+    const todo = entries.filter(e => e.genres === undefined);
+    let i = 0;
+    await Promise.all(Array.from({ length: 4 }, async () => {
+      while (i < todo.length) {
+        const e = todo[i++];
+        try {
+          const d = await tmdb(`/${e.type}/${e.tmdbId}`);
+          const genres = (d.genres || []).map(g => g.id);
+          await updateDoc(doc(db, "entries", entryId(me.uid, e.key)), { genres });
+          e.genres = genres; if (myEntries[e.key]) myEntries[e.key].genres = genres;
+          changed = true;
+        } catch { /* try again next visit */ }
+      }
+    }));
+  } finally { backfilling = false; }
+  return changed;
+}
+
+/* ---------- profile (sorting, genre filter) ---------- */
+const DEFAULT_VIEW = { tab: "diary", filter: "all", sort: "recent", genre: "all" };
+const profileView = { ...DEFAULT_VIEW };
+const SORT_LABELS = {
+  recent: "Recently logged", watched: "Watch date (newest)", watched_old: "Watch date (oldest)",
+  rating_high: "Rating (high → low)", rating_low: "Rating (low → high)", title: "Title (A–Z)",
+  year_new: "Release year (newest)", year_old: "Release year (oldest)", genre: "Genre (grouped)"
+};
+const WATCHLIST_SORTS = ["recent", "title", "year_new", "year_old", "genre"];
+const byRecent = (a, b) => (b.updatedAt?.seconds || 0) - (a.updatedAt?.seconds || 0);
+const byTitle = (a, b) => (a.title || "").localeCompare(b.title || "");
+const SORT_FNS = {
+  recent: byRecent,
+  watched: (a, b) => (b.watchedOn || "").localeCompare(a.watchedOn || "") || byRecent(a, b),
+  watched_old: (a, b) => (!a.watchedOn && !b.watchedOn) ? byRecent(a, b) : !a.watchedOn ? 1 : !b.watchedOn ? -1 : a.watchedOn.localeCompare(b.watchedOn),
+  rating_high: (a, b) => (b.rating ?? -1) - (a.rating ?? -1) || byRecent(a, b),
+  rating_low: (a, b) => (a.rating ?? 99) - (b.rating ?? 99) || byRecent(a, b),
+  title: byTitle,
+  year_new: (a, b) => (+b.year || 0) - (+a.year || 0) || byTitle(a, b),
+  year_old: (a, b) => (+a.year || 9999) - (+b.year || 9999) || byTitle(a, b),
+  genre: byTitle
+};
+const profCard = e => `<a class="card" href="#/title/${e.type}/${e.tmdbId}">
+  ${posterImg(e.poster, e.title)}
+  ${e.type === "tv" ? `<span class="badge">TV</span>` : ""}
+  <div class="cap"><span class="stars">${starsText(e.rating)}</span> ${esc(e.title)}</div></a>`;
+
+async function pageUser(uid, patch) {
+  Object.assign(profileView, patch || DEFAULT_VIEW);
   const u = users[uid]; if (!u) { view.innerHTML = `<p class="muted">Unknown user.</p>`; return; }
   const snap = await getDocs(query(collection(db, "entries"), where("uid", "==", uid)));
   const all = snap.docs.map(d => d.data());
   const watched = all.filter(e => e.status === "watched");
   const rated = watched.filter(e => e.rating != null);
   const avg = rated.length ? (rated.reduce((s, e) => s + e.rating, 0) / rated.length).toFixed(2) : "–";
-  const list = (tab === "diary" ? watched : all.filter(e => e.status === "watchlist"))
-    .filter(e => filter === "all" || e.type === filter)
-    .sort((a, b) => tab === "diary"
-      ? (b.watchedOn || "").localeCompare(a.watchedOn || "") || (b.updatedAt?.seconds || 0) - (a.updatedAt?.seconds || 0)
-      : (b.updatedAt?.seconds || 0) - (a.updatedAt?.seconds || 0));
+  const { tab, filter } = profileView;
+  let { sort, genre } = profileView;
+  if (tab === "watchlist" && !WATCHLIST_SORTS.includes(sort)) sort = profileView.sort = "recent";
+  const missing = uid === me.uid ? all.filter(e => e.genres === undefined) : [];
+
+  let controls = "", body = "";
+  if (tab === "lists") {
+    let ls = [];
+    try {
+      ls = (await getDocs(query(collection(db, "lists"), where("owner", "==", uid), where("shared", "==", false))))
+        .docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (b.updatedAt?.seconds || 0) - (a.updatedAt?.seconds || 0));
+    } catch { /* rules not published yet */ }
+    body = ls.length ? `<div class="lgrid">${ls.map(listCard).join("")}</div>` : `<p class="muted">No lists yet.</p>`;
+  } else {
+    const base = (tab === "diary" ? watched : all.filter(e => e.status === "watchlist")).filter(e => filter === "all" || e.type === filter);
+    const gc = new Map();
+    base.forEach(e => genreNames(e).forEach(n => gc.set(n, (gc.get(n) || 0) + 1)));
+    if (genre !== "all" && !gc.has(genre)) genre = profileView.genre = "all";
+    const sortKeys = tab === "diary" ? Object.keys(SORT_LABELS) : WATCHLIST_SORTS;
+    controls = `<div class="sortbar">
+      <select id="sortSel">${sortKeys.map(k => `<option value="${k}" ${k === sort ? "selected" : ""}>Sort: ${SORT_LABELS[k]}</option>`).join("")}</select>
+      <select id="genreSel"><option value="all">All genres</option>${[...gc.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([n, c]) => `<option value="${esc(n)}" ${n === genre ? "selected" : ""}>${esc(n)} (${c})</option>`).join("")}</select>
+    </div>`;
+    const list = base.filter(e => genre === "all" || genreNames(e).includes(genre)).sort(SORT_FNS[sort]);
+    if (!list.length) body = `<p class="muted">Nothing here yet.</p>`;
+    else if (sort === "genre") {
+      const groups = new Map();
+      list.forEach(e => { const g = genreOf(e); if (!groups.has(g)) groups.set(g, []); groups.get(g).push(e); });
+      const keys = [...groups.keys()].sort((a, b) => a === "Other" ? 1 : b === "Other" ? -1 : a.localeCompare(b));
+      body = keys.map(g => `<h2>${esc(g)} <span style="text-transform:none;letter-spacing:0">· ${groups.get(g).length}</span></h2><div class="grid">${groups.get(g).map(profCard).join("")}</div>`).join("");
+    } else body = `<div class="grid">${list.map(profCard).join("")}</div>`;
+  }
 
   view.innerHTML = `<div class="row" style="margin-bottom:14px">
       ${u.photo ? `<img class="avatar" style="width:56px;height:56px" src="${esc(u.photo)}" referrerpolicy="no-referrer" alt="">` : ""}
@@ -480,18 +665,312 @@ async function pageUser(uid, tab = "diary", filter = "all") {
       <div class="stat"><b>${all.filter(e => e.status === "watchlist").length}</b><span>Watchlist</span></div>
     </div>
     <div class="tabs" style="margin-top:18px">
-      <span class="tab ${tab === "diary" ? "on" : ""}" data-t="diary">Diary</span>
-      <span class="tab ${tab === "watchlist" ? "on" : ""}" data-t="watchlist">Watchlist</span>
+      ${[["diary", "Diary"], ["watchlist", "Watchlist"], ["lists", "Lists"]].map(([t, l]) => `<span class="tab ${tab === t ? "on" : ""}" data-t="${t}">${l}</span>`).join("")}
       <span style="flex:1"></span>
-      ${["all", "movie", "tv"].map(f => `<span class="tab ${f === filter ? "on" : ""}" data-f="${f}">${{ all: "All", movie: "Films", tv: "TV" }[f]}</span>`).join("")}
+      ${tab === "lists" ? "" : ["all", "movie", "tv"].map(f => `<span class="tab ${f === filter ? "on" : ""}" data-f="${f}">${{ all: "All", movie: "Films", tv: "TV" }[f]}</span>`).join("")}
     </div>
-    ${list.length ? `<div class="grid">${list.map(e => `<a class="card" href="#/title/${e.type}/${e.tmdbId}">
-        ${posterImg(e.poster, e.title)}
-        ${e.type === "tv" ? `<span class="badge">TV</span>` : ""}
-        <div class="cap"><span class="stars">${starsText(e.rating)}</span> ${esc(e.title)}</div></a>`).join("")}</div>`
-      : `<p class="muted">Nothing here yet.</p>`}`;
-  view.querySelectorAll("[data-t]").forEach(t => (t.onclick = () => pageUser(uid, t.dataset.t, filter)));
-  view.querySelectorAll("[data-f]").forEach(t => (t.onclick = () => pageUser(uid, tab, t.dataset.f)));
+    ${controls}
+    <p id="gnote" class="muted" style="font-size:12px;margin:0 0 10px"></p>
+    ${body}`;
+  view.querySelectorAll("[data-t]").forEach(t => (t.onclick = () => pageUser(uid, { tab: t.dataset.t })));
+  view.querySelectorAll("[data-f]").forEach(t => (t.onclick = () => pageUser(uid, { filter: t.dataset.f })));
+  if ($("#sortSel")) $("#sortSel").onchange = e => pageUser(uid, { sort: e.target.value });
+  if ($("#genreSel")) $("#genreSel").onchange = e => pageUser(uid, { genre: e.target.value });
+
+  if (missing.length && tab !== "lists") {
+    $("#gnote").textContent = "Fetching genre info for older entries…";
+    backfillGenres(missing).then(ch => { if (ch && location.hash.startsWith("#/me")) pageUser(uid, {}); });
+  }
+}
+
+/* ---------- lists (regular, numbered, shared watchlists) ---------- */
+const listItemOf = m => ({
+  key: m.key, type: m.type, tmdbId: m.tmdbId, title: m.title || "", year: m.year || "",
+  poster: m.poster || "", genres: m.genres || [], label: "", addedBy: me.uid
+});
+
+async function fetchLists() {
+  const [pub, mine] = await Promise.all([
+    getDocs(query(collection(db, "lists"), where("shared", "==", false))),
+    getDocs(query(collection(db, "lists"), where("members", "array-contains", me.uid)))
+  ]);
+  const map = new Map();
+  [...pub.docs, ...mine.docs].forEach(d => map.set(d.id, { id: d.id, ...d.data() }));
+  return [...map.values()].sort((a, b) => (b.updatedAt?.seconds || 0) - (a.updatedAt?.seconds || 0));
+}
+
+function listCard(l) {
+  const items = l.items || [];
+  const collage = items.slice(0, 4).map(i => posterImg(i.poster, i.title)).join("") || `<div class="poster" style="height:96px"></div>`;
+  return `<a class="lcard" href="#/list/${l.id}">
+    <div class="collage">${collage}</div>
+    <b>${esc(l.title)}</b>
+    <div class="muted" style="font-size:13px">${items.length} title${items.length === 1 ? "" : "s"} · by ${esc(userName(l.owner))}</div>
+    ${l.ranked ? `<span class="tag">Numbered</span>` : ""}${l.shared ? `<span class="tag">Shared · ${(l.members || []).length} people</span>` : ""}
+  </a>`;
+}
+
+async function pageLists(tab = "all") {
+  if (!["all", "mine", "shared"].includes(tab)) tab = "all";
+  view.innerHTML = `<div class="row" style="justify-content:space-between"><h1 style="margin:0">Lists</h1><button id="newlist">＋ New list</button></div>
+    <div class="tabs" style="margin-top:14px">${[["all", "Everyone's lists"], ["mine", "My lists"], ["shared", "Shared watchlists"]].map(([k, l]) => `<span class="tab ${k === tab ? "on" : ""}" data-tab="${k}">${l}</span>`).join("")}</div>
+    <div id="lgrid"><p class="muted">Loading…</p></div>`;
+  $("#newlist").onclick = () => openListForm(null);
+  view.querySelectorAll("[data-tab]").forEach(t => (t.onclick = () => (location.hash = "#/lists/" + t.dataset.tab)));
+  let ls;
+  try { ls = await fetchLists(); }
+  catch (e) { $("#lgrid").innerHTML = `<p style="color:var(--danger)">${esc(e.message)}<br>Did you publish the new Firestore rules?</p>`; return; }
+  const shown = ls.filter(l => tab === "mine" ? l.owner === me.uid : tab === "shared" ? l.shared && l.members.includes(me.uid) : !l.shared);
+  const empty = { all: "No lists yet. Make the first one!", mine: "You haven't made any lists yet.", shared: "No shared watchlists yet. Make one and pick a friend to watch through it with." }[tab];
+  $("#lgrid").innerHTML = shown.length ? `<div class="lgrid">${shown.map(listCard).join("")}</div>` : `<p class="muted">${empty}</p>`;
+}
+
+function openListForm(list) {
+  const isNew = !list;
+  const l = list || { title: "", description: "", ranked: false, shared: false, members: [me.uid] };
+  const others = Object.entries(users).filter(([uid]) => uid !== me.uid);
+  const memberBox = `<div id="lm" ${(isNew || !l.shared) ? "hidden" : ""}>
+    <label>Who's in it</label>
+    ${others.map(([uid, u]) => `<label class="chk" style="margin:8px 0"><input type="checkbox" class="mem" value="${uid}" ${l.members.includes(uid) ? "checked" : ""}> ${avatar(uid)} ${esc(u.name)}</label>`).join("") || `<p class="muted">No friends have signed in yet.</p>`}
+  </div>`;
+  modalOpen(`<h2 style="margin-top:0;border:0">${isNew ? "New list" : "List settings"}</h2>
+    <label>Title</label><input id="lt" maxlength="100" value="${esc(l.title)}" placeholder="e.g. Best horror of the 80s">
+    <label>Description <span class="muted" style="text-transform:none">(optional)</span></label><textarea id="ld" maxlength="500">${esc(l.description || "")}</textarea>
+    <label class="chk" style="margin-top:12px"><input type="checkbox" id="lr" ${l.ranked ? "checked" : ""}> Numbered list (1, 2, 3…)</label>
+    ${isNew ? `<label class="chk" style="margin-top:8px"><input type="checkbox" id="ls"> Shared watchlist — check things off together</label>` : ""}
+    ${memberBox}
+    <div class="row" style="margin-top:18px;justify-content:space-between">
+      <div>${!isNew ? `<button class="danger" id="ldel">Delete list</button>` : ""}</div>
+      <div class="row"><button class="ghost" id="lcancel">Cancel</button><button id="lsave">${isNew ? "Create" : "Save"}</button></div>
+    </div>`);
+  if (isNew) $("#ls").onchange = () => ($("#lm").hidden = !$("#ls").checked);
+  $("#lcancel").onclick = modalClose;
+  if ($("#ldel")) $("#ldel").onclick = async () => {
+    if (!confirm("Delete this list for good?")) return;
+    await deleteDoc(doc(db, "lists", l.id)); modalClose(); toast("List deleted"); location.hash = "#/lists";
+  };
+  $("#lsave").onclick = async () => {
+    const title = $("#lt").value.trim();
+    if (!title) { toast("Give it a title"); return; }
+    const shared = isNew ? $("#ls").checked : l.shared;
+    const picked = [...document.querySelectorAll(".mem:checked")].map(c => c.value);
+    if (shared && !picked.length) { toast("Pick at least one friend to share with"); return; }
+    const members = shared ? [me.uid, ...picked] : [me.uid];
+    try {
+      if (isNew) {
+        const ref = doc(collection(db, "lists"));
+        await setDoc(ref, {
+          owner: me.uid, title, description: $("#ld").value.trim(), ranked: $("#lr").checked, shared, members,
+          items: [], watched: {}, createdAt: serverTimestamp(), updatedAt: serverTimestamp()
+        });
+        modalClose(); editing = true; listView = null; location.hash = "#/list/" + ref.id;
+      } else {
+        await updateDoc(doc(db, "lists", l.id), { title, description: $("#ld").value.trim(), ranked: $("#lr").checked, members, updatedAt: serverTimestamp() });
+        modalClose(); toast("Saved"); await reloadList();
+      }
+    } catch (e) { toast("Couldn't save: " + e.message + " (did you publish the new Firestore rules?)"); }
+  };
+}
+
+let curList = null, editing = false, listView = null;
+
+async function reloadList() {
+  const s = await getDoc(doc(db, "lists", curList.id));
+  renderList({ id: curList.id, ...s.data() });
+}
+async function mutateList(id, fn) {
+  const ref = doc(db, "lists", id);
+  const data = (await getDoc(ref)).data();
+  const items = fn([...(data.items || [])]);
+  await updateDoc(ref, { items, updatedAt: serverTimestamp() });
+  return { id, ...data, items };
+}
+
+async function writeDiaryFromList(it, on) {
+  const ex = myEntries[it.key];
+  if (ex && ex.status === "watched") return false;
+  const data = {
+    type: it.type, tmdbId: it.tmdbId, key: it.key, title: it.title, year: it.year || "", poster: it.poster || "",
+    genres: it.genres || ex?.genres || [], uid: me.uid, status: "watched",
+    rating: ex?.rating ?? null, review: ex?.review || "", watchedOn: on || "", season: ex?.season || "",
+    updatedAt: serverTimestamp()
+  };
+  await setDoc(doc(db, "entries", entryId(me.uid, it.key)), data);
+  myEntries[it.key] = { ...data, updatedAt: { toDate: () => new Date() } };
+  return true;
+}
+// make sure everything a shared list has checked off is in MY diary too
+async function syncSharedList(l) {
+  let n = 0;
+  for (const [key, w] of Object.entries(l.watched || {})) {
+    const it = (l.items || []).find(i => i.key === key);
+    if (it && (await writeDiaryFromList(it, w.on))) n++;
+  }
+  return n;
+}
+async function syncShared() {
+  const snap = await getDocs(query(collection(db, "lists"), where("members", "array-contains", me.uid)));
+  let n = 0;
+  for (const d of snap.docs) { const l = { id: d.id, ...d.data() }; if (l.shared) n += await syncSharedList(l); }
+  if (n) toast(`Added ${n} shared title${n === 1 ? "" : "s"} to your diary`);
+}
+
+function openWatched(l, it) {
+  const today = new Date().toISOString().slice(0, 10);
+  modalOpen(`<div class="modal-head">${posterImg(it.poster, it.title)}
+      <div><b style="font-size:17px">${esc(it.title)}</b><div class="muted">${esc(it.year)}</div></div></div>
+    <p>Mark as watched together? It goes into everyone's diary on this list.</p>
+    <label>Date watched</label>
+    <div class="row"><input type="date" id="wd" value="${today}" style="flex:1;width:auto">
+      <label class="chk"><input type="checkbox" id="wn"> No date</label></div>
+    <div class="row" style="margin-top:16px;justify-content:flex-end"><button class="ghost" id="wc">Cancel</button><button id="ws">Mark watched</button></div>`);
+  $("#wn").onchange = () => ($("#wd").disabled = $("#wn").checked);
+  $("#wc").onclick = modalClose;
+  $("#ws").onclick = async () => {
+    const on = $("#wn").checked ? "" : $("#wd").value || today;
+    try {
+      await updateDoc(doc(db, "lists", l.id), { [`watched.${it.key}`]: { on, by: me.uid }, updatedAt: serverTimestamp() });
+      await writeDiaryFromList(it, on);
+      modalClose(); toast("Watched together ✓"); await reloadList();
+    } catch (e) { toast("Couldn't save: " + e.message); }
+  };
+}
+
+async function pageList(id) {
+  view.innerHTML = `<p class="muted">Loading…</p>`;
+  editing = editing && location.hash.includes(id); // a freshly created list opens in edit mode
+  let l;
+  try {
+    const s = await getDoc(doc(db, "lists", id));
+    if (!s.exists()) throw new Error("missing");
+    l = { id, ...s.data() };
+  } catch { view.innerHTML = `<p class="muted">That list doesn't exist, or it's private.</p>`; return; }
+  listView = null;
+  if (l.shared) { try { const n = await syncSharedList(l); if (n) toast(`Added ${n} shared title${n === 1 ? "" : "s"} to your diary`); } catch { /* ignore */ } }
+  renderList(l);
+}
+
+function renderList(l) {
+  curList = l;
+  const isOwner = l.owner === me.uid;
+  const canEdit = isOwner || (l.shared && l.members.includes(me.uid));
+  if (!canEdit) editing = false;
+  const asRows = editing || (listView ? listView === "rows" : !!l.ranked);
+  view.innerHTML = `<div class="row" style="justify-content:space-between;align-items:flex-start">
+      <div style="flex:1;min-width:220px">
+        <h1 style="margin-bottom:4px">${esc(l.title)}</h1>
+        <div class="muted">by <a href="#/user/${l.owner}"><b>${esc(userName(l.owner))}</b></a> · <span id="lcount"></span>${l.ranked ? " · numbered" : ""}</div>
+        ${l.shared ? `<div class="muted" style="margin-top:4px">Shared with ${l.members.filter(m => m !== l.owner).map(m => esc(userName(m))).join(", ")}</div>` : ""}
+        ${l.description ? `<p style="white-space:pre-wrap">${esc(l.description)}</p>` : ""}
+      </div>
+      <div class="row">
+        ${canEdit ? `<button class="small ${editing ? "" : "ghost"}" id="ledit">${editing ? "Done" : "Edit"}</button>` : ""}
+        ${isOwner ? `<button class="ghost small" id="lset">Settings</button>` : ""}
+        ${editing ? "" : `<button class="ghost small" id="lview">${asRows ? "Grid view" : "List view"}</button>`}
+      </div>
+    </div>
+    ${editing ? `<div id="ladd" class="picker"></div>` : ""}
+    <div id="litems" style="margin-top:14px"></div>`;
+  if ($("#ledit")) $("#ledit").onclick = () => { editing = !editing; renderList(curList); };
+  if ($("#lset")) $("#lset").onclick = () => openListForm(curList);
+  if ($("#lview")) $("#lview").onclick = () => { listView = asRows ? "grid" : "rows"; renderList(curList); };
+  if (editing) {
+    titlePicker($("#ladd"), async m => {
+      if (curList.items.some(i => i.key === m.key)) { toast("Already in this list"); return; }
+      try { curList = await mutateList(curList.id, items => [...items, listItemOf(m)]); renderItems(); toast("Added"); }
+      catch (e) { toast("Couldn't add: " + e.message); }
+    });
+  }
+  $("#litems").onclick = async ev => {
+    const cur = curList;
+    const chk = ev.target.closest("[data-chk]");
+    if (chk) {
+      const it = cur.items.find(i => i.key === chk.dataset.chk); if (!it) return;
+      if (cur.watched?.[it.key]) {
+        if (!confirm("Uncheck this? It stays in everyone's diaries.")) return;
+        await updateDoc(doc(db, "lists", cur.id), { [`watched.${it.key}`]: deleteField() });
+        await reloadList();
+      } else openWatched(cur, it);
+      return;
+    }
+    const up = ev.target.closest("[data-up]"), down = ev.target.closest("[data-down]"), rm = ev.target.closest("[data-rm]");
+    const btn = up || down || rm; const k = btn && (btn.dataset.up || btn.dataset.down || btn.dataset.rm);
+    if (!k) return;
+    try {
+      curList = await mutateList(cur.id, items => {
+        const i = items.findIndex(x => x.key === k); if (i < 0) return items;
+        if (rm) items.splice(i, 1);
+        else if (up && i > 0) [items[i - 1], items[i]] = [items[i], items[i - 1]];
+        else if (down && i < items.length - 1) [items[i + 1], items[i]] = [items[i], items[i + 1]];
+        return items;
+      });
+      renderItems();
+    } catch (e) { toast("Couldn't update: " + e.message); }
+  };
+  $("#litems").onchange = async ev => {
+    const inp = ev.target.closest(".lbl"); if (!inp) return;
+    try {
+      curList = await mutateList(curList.id, items => { const x = items.find(z => z.key === inp.dataset.k); if (x) x.label = inp.value.trim(); return items; });
+      toast("Saved");
+    } catch (e) { toast("Couldn't save: " + e.message); }
+  };
+  renderItems();
+}
+
+function renderItems() {
+  const l = curList, items = l.items || [], watched = l.watched || {};
+  const asRows = editing || (listView ? listView === "rows" : !!l.ranked);
+  const doneN = items.filter(i => watched[i.key]).length;
+  $("#lcount").textContent = `${items.length} title${items.length === 1 ? "" : "s"}` + (l.shared ? ` · ${doneN} watched together` : "");
+  if (!items.length) { $("#litems").innerHTML = `<p class="muted">${editing ? "Search above to add titles." : "Nothing in this list yet."}</p>`; return; }
+  const chkBtn = (it, w) => l.shared ? `<button class="small ${w ? "" : "ghost"}" data-chk="${esc(it.key)}">${w ? "✓ Watched" : "Mark watched"}</button>` : "";
+  if (asRows) {
+    $("#litems").innerHTML = items.map((it, i) => {
+      const w = watched[it.key];
+      return `<div class="lrow ${w ? "done" : ""}">
+        ${l.ranked ? `<div class="rank">${i + 1}</div>` : ""}
+        <div class="pw"><a href="#/title/${it.type}/${it.tmdbId}">${posterImg(it.poster, it.title)}</a>${w ? `<span class="tick">✓</span>` : ""}</div>
+        <div class="linfo">
+          <div class="title"><a href="#/title/${it.type}/${it.tmdbId}">${esc(it.title)}</a> <span class="muted" style="font-weight:400">${esc(it.year)}</span></div>
+          ${editing ? `<input class="lbl" data-k="${esc(it.key)}" maxlength="120" placeholder="Add a label or note…" value="${esc(it.label || "")}">`
+                    : (it.label ? `<div class="lbl-text">${esc(it.label)}</div>` : "")}
+          ${w ? `<div class="muted" style="font-size:12px">Watched together${w.on ? " on " + fmtDate(w.on) : ""}</div>` : ""}
+          ${editing ? "" : chkBtn(it, w)}
+        </div>
+        ${editing ? `<div class="ctrl"><button class="ghost small" data-up="${esc(it.key)}">↑</button><button class="ghost small" data-down="${esc(it.key)}">↓</button><button class="danger small" data-rm="${esc(it.key)}">✕</button></div>` : ""}
+      </div>`;
+    }).join("");
+  } else {
+    $("#litems").innerHTML = `<div class="grid">${items.map((it, i) => {
+      const w = watched[it.key];
+      return `<div class="lcell ${w ? "done" : ""}">
+        <div class="pw"><a href="#/title/${it.type}/${it.tmdbId}">${posterImg(it.poster, it.title)}</a>
+          ${l.ranked ? `<span class="badge">${i + 1}</span>` : ""}${w ? `<span class="tick">✓</span>` : ""}</div>
+        <div class="cap" style="font-size:12px;color:var(--muted)">${esc(it.title)}</div>
+        ${it.label ? `<div class="lbl-text">${esc(it.label)}</div>` : ""}
+        ${chkBtn(it, w)}</div>`;
+    }).join("")}</div>`;
+  }
+}
+
+async function openAddToList(meta) {
+  modalOpen(`<h2 style="margin-top:0;border:0">Add to a list</h2><div id="atl"><p class="muted">Loading…</p></div>
+    <div class="row" style="margin-top:14px;justify-content:space-between"><button class="ghost small" id="atn">＋ New list</button><button class="ghost" id="atc">Close</button></div>`);
+  $("#atc").onclick = modalClose;
+  $("#atn").onclick = () => openListForm(null);
+  try {
+    const mine = (await fetchLists()).filter(l => l.owner === me.uid || (l.shared && l.members.includes(me.uid)));
+    $("#atl").innerHTML = mine.length ? mine.map(l => `<div class="pick" data-id="${l.id}"><div><b>${esc(l.title)}</b>
+        <span class="muted">${l.shared ? "shared · " : ""}${(l.items || []).length} titles</span> ${(l.items || []).some(i => i.key === meta.key) ? "✓ already in" : ""}</div></div>`).join("")
+      : `<p class="muted">You don't have any lists yet.</p>`;
+    $("#atl").onclick = async ev => {
+      const p = ev.target.closest(".pick"); if (!p) return;
+      try {
+        await mutateList(p.dataset.id, items => items.some(i => i.key === meta.key) ? items : [...items, listItemOf(meta)]);
+        modalClose(); toast("Added to list");
+      } catch (e) { toast("Couldn't add: " + e.message); }
+    };
+  } catch (e) { $("#atl").innerHTML = `<p style="color:var(--danger)">${esc(e.message)}</p>`; }
 }
 
 /* ---------- friends ---------- */
